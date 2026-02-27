@@ -29,9 +29,13 @@ def main() -> None:
             chain_id = w3.eth.chain_id
             latest_block = w3.eth.block_number
             latency_ms = (time.perf_counter() - start) * 1000
+            status = "OK"
+            if chain_id != chain.expected_chain_id:
+                status = "MISMATCH"
             print(
-                f"[{chain.name:10}] OK   chain_id={chain_id:<8} "
-                f"latest_block={latest_block:<12} latency={latency_ms:.1f}ms"
+                f"[{chain.name:10}] {status:<9} chain_id={chain_id:<8} "
+                f"expected={chain.expected_chain_id:<8} latest_block={latest_block:<12} "
+                f"latency={latency_ms:.1f}ms"
             )
         except Exception as exc:
             latency_ms = (time.perf_counter() - start) * 1000
