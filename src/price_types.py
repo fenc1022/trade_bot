@@ -26,3 +26,19 @@ class SpreadSignal:
     price_b: float
     ratio_a_over_b: float
     spread_pct: float
+
+
+@dataclass(frozen=True)
+class ArbitrageOpportunity:
+    timestamp: datetime
+    pair_key: str
+    buy_chain: str
+    sell_chain: str
+    buy_price: float
+    sell_price: float
+    difference: float
+    difference_pct: float
+    volume: float
+    gross_profit: float
+    fees: float
+    net_profit: float

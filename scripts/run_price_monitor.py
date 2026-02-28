@@ -13,9 +13,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.collector import collect_v2_snapshots
-from src.config import get_chain_configs, get_v2_pool_configs
+from src.config import get_arbitrage_config, get_chain_configs, get_v2_pool_configs
 from src.dex_uniswap_v2 import UniswapV2ReserveReader
-from src.ratio import compute_cross_chain_spreads
+from src.ratio import compute_arbitrage_opportunities, compute_cross_chain_spreads
 
 
 def _build_chain_web3() -> dict[str, Web3]:
@@ -30,6 +30,7 @@ def _validate_pool_chains(pool_chains: set[str], configured_chains: set[str]) ->
 
 async def main() -> None:
     pools = get_v2_pool_configs()
+    arb_cfg = get_arbitrage_config()
     if not pools:
         print("No pools configured. Set V2_POOLS_JSON in .env (see .env.example).")
         return
@@ -45,12 +46,17 @@ async def main() -> None:
         return
 
     reader = UniswapV2ReserveReader(chain_web3)
-    print("Starting Step 2 monitor (Ctrl+C to stop)")
+    print("Starting price monitor (Ctrl+C to stop)")
     print("=" * 90)
+    print(
+        f"Arbitrage config: volume={arb_cfg.volume:.2f}, "
+        f"min_diff_pct={arb_cfg.min_diff_pct:.3f}%, default_fees={arb_cfg.default_fees:.2f}"
+    )
 
     while True:
         snapshots, errors = await collect_v2_snapshots(reader, pools)
         spreads = compute_cross_chain_spreads(snapshots)
+        opportunities = compute_arbitrage_opportunities(snapshots, arb_cfg)
 
         for error in errors:
             print(f"ERROR {error}")
@@ -70,6 +76,15 @@ async def main() -> None:
                 print(
                     f"  {spread.pair_key:14} {spread.chain_a:10}/{spread.chain_b:10} "
                     f"ratio={spread.ratio_a_over_b:.6f} spread={spread.spread_pct:+.3f}%"
+                )
+
+        if opportunities:
+            print("Arbitrage opportunities (after fees):")
+            for opp in opportunities:
+                print(
+                    f"  {opp.pair_key:14} buy={opp.buy_chain:10} sell={opp.sell_chain:10} "
+                    f"diff={opp.difference_pct:+.3f}% gross={opp.gross_profit:.4f} "
+                    f"fees={opp.fees:.4f} net={opp.net_profit:.4f}"
                 )
 
         print("-" * 90)
