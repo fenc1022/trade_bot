@@ -3,7 +3,7 @@ from __future__ import annotations
 from itertools import combinations
 
 from src.config import ArbitrageConfig
-from src.price_types import ArbitrageOpportunity, PriceSnapshot, SpreadSignal
+from src.price_types import ArbitrageOpportunity, FeeBreakdown, PriceSnapshot, SpreadSignal
 
 
 def compute_cross_chain_spreads(snapshots: list[PriceSnapshot]) -> list[SpreadSignal]:
@@ -41,6 +41,7 @@ def compute_cross_chain_spreads(snapshots: list[PriceSnapshot]) -> list[SpreadSi
 def compute_arbitrage_opportunities(
     snapshots: list[PriceSnapshot],
     cfg: ArbitrageConfig,
+    route_fees: dict[tuple[str, str], FeeBreakdown],
 ) -> list[ArbitrageOpportunity]:
     by_pair: dict[str, list[PriceSnapshot]] = {}
     for snapshot in snapshots:
@@ -66,12 +67,21 @@ def compute_arbitrage_opportunities(
             difference = higher_price - lower_price
             difference_pct = (difference / lower_price) * 100
             gross_profit = (difference / lower_price) * cfg.volume
-            fees = cfg.fees_for_route(buy_chain=lower.chain, sell_chain=higher.chain)
+            fee_quote = route_fees.get((lower.chain, higher.chain))
+            if not fee_quote:
+                continue
+
+            fees = fee_quote.total_fees_usd
             net_profit = gross_profit - fees
+            net_profit_pct = (net_profit / cfg.volume) * 100
 
             if difference_pct < cfg.min_diff_pct:
                 continue
             if net_profit <= 0:
+                continue
+            if net_profit < cfg.min_net_profit:
+                continue
+            if net_profit_pct < cfg.min_net_profit_pct:
                 continue
 
             opportunities.append(

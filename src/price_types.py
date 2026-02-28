@@ -42,3 +42,14 @@ class ArbitrageOpportunity:
     gross_profit: float
     fees: float
     net_profit: float
+
+
+@dataclass(frozen=True)
+class FeeBreakdown:
+    buy_chain: str
+    sell_chain: str
+    gas_buy_usd: float
+    gas_sell_usd: float
+    bridge_fee_usd: float
+    dex_fee_usd: float
+    total_fees_usd: float

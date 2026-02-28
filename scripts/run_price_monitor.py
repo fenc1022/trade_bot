@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.collector import collect_v2_snapshots
 from src.config import get_arbitrage_config, get_chain_configs, get_v2_pool_configs
 from src.dex_uniswap_v2 import UniswapV2ReserveReader
+from src.fees import FeeEstimationError, RealTimeFeeEstimator, route_pairs_from_snapshots
 from src.ratio import compute_arbitrage_opportunities, compute_cross_chain_spreads
 
 
@@ -32,7 +33,7 @@ async def main() -> None:
     pools = get_v2_pool_configs()
     arb_cfg = get_arbitrage_config()
     if not pools:
-        print("No pools configured. Set V2_POOLS_JSON in .env (see .env.example).")
+        print("No pools configured. Set V2_POOLS_JSON in .env.")
         return
 
     chain_web3 = _build_chain_web3()
@@ -46,20 +47,43 @@ async def main() -> None:
         return
 
     reader = UniswapV2ReserveReader(chain_web3)
+    fee_estimator = RealTimeFeeEstimator(chain_web3=chain_web3, cfg=arb_cfg)
     print("Starting price monitor (Ctrl+C to stop)")
     print("=" * 90)
     print(
         f"Arbitrage config: volume={arb_cfg.volume:.2f}, "
-        f"min_diff_pct={arb_cfg.min_diff_pct:.3f}%, default_fees={arb_cfg.default_fees:.2f}"
+        f"min_diff_pct={arb_cfg.min_diff_pct:.3f}%, "
+        f"min_net_profit={arb_cfg.min_net_profit:.3f}, "
+        f"min_net_profit_pct={arb_cfg.min_net_profit_pct:.3f}%"
     )
 
     while True:
         snapshots, errors = await collect_v2_snapshots(reader, pools)
         spreads = compute_cross_chain_spreads(snapshots)
-        opportunities = compute_arbitrage_opportunities(snapshots, arb_cfg)
+        route_fees = {}
+        fee_errors: list[str] = []
+        for buy_chain, sell_chain in sorted(route_pairs_from_snapshots(snapshots)):
+            try:
+                route_fees[(buy_chain, sell_chain)] = fee_estimator.estimate_route_fees(
+                    buy_chain=buy_chain,
+                    sell_chain=sell_chain,
+                    volume=arb_cfg.volume,
+                )
+            except (FeeEstimationError, ValueError, KeyError, OSError) as exc:
+                fee_errors.append(
+                    f"fee_quote_failed route={buy_chain}->{sell_chain} reason={exc}"
+                )
+
+        opportunities = compute_arbitrage_opportunities(
+            snapshots=snapshots,
+            cfg=arb_cfg,
+            route_fees=route_fees,
+        )
 
         for error in errors:
             print(f"ERROR {error}")
+        for fee_error in fee_errors:
+            print(f"ERROR {fee_error}")
 
         if snapshots:
             print("Latest snapshots:")
@@ -81,10 +105,13 @@ async def main() -> None:
         if opportunities:
             print("Arbitrage opportunities (after fees):")
             for opp in opportunities:
+                fee_quote = route_fees[(opp.buy_chain, opp.sell_chain)]
                 print(
                     f"  {opp.pair_key:14} buy={opp.buy_chain:10} sell={opp.sell_chain:10} "
                     f"diff={opp.difference_pct:+.3f}% gross={opp.gross_profit:.4f} "
-                    f"fees={opp.fees:.4f} net={opp.net_profit:.4f}"
+                    f"fees={opp.fees:.4f} net={opp.net_profit:.4f} "
+                    f"(gas={fee_quote.gas_buy_usd + fee_quote.gas_sell_usd:.4f}, "
+                    f"bridge={fee_quote.bridge_fee_usd:.4f}, dex={fee_quote.dex_fee_usd:.4f})"
                 )
 
         print("-" * 90)
@@ -95,6 +122,6 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except json.JSONDecodeError:
-        print("Invalid V2_POOLS_JSON format in .env. Use valid JSON array (see .env.example).")
+        print("Invalid JSON format in .env. Check V2_POOLS_JSON and fee config JSON fields.")
     except KeyboardInterrupt:
         print("Stopped.")

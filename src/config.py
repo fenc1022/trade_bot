@@ -35,11 +35,12 @@ class V2PoolConfig:
 class ArbitrageConfig:
     volume: float
     min_diff_pct: float
-    default_fees: float
-    route_fees: dict[tuple[str, str], float]
-
-    def fees_for_route(self, buy_chain: str, sell_chain: str) -> float:
-        return self.route_fees.get((buy_chain, sell_chain), self.default_fees)
+    min_net_profit: float
+    min_net_profit_pct: float
+    dex_fee_bps_per_swap: float
+    gas_units_per_swap: int
+    bridge_fee_url_template: str
+    bridge_fee_json_path: str
 
 
 def get_chain_configs() -> list[ChainConfig]:
@@ -84,21 +85,20 @@ def get_v2_pool_configs() -> list[V2PoolConfig]:
 def get_arbitrage_config() -> ArbitrageConfig:
     volume = float(os.getenv("ARB_TRADE_VOLUME", "1000"))
     min_diff_pct = float(os.getenv("ARB_MIN_DIFF_PCT", "0.1"))
-    default_fees = float(os.getenv("ARB_DEFAULT_FEES", "2.0"))
-
-    route_fees_raw = os.getenv("ARB_ROUTE_FEES_JSON", "").strip()
-    route_fees: dict[tuple[str, str], float] = {}
-    if route_fees_raw:
-        payload = json.loads(route_fees_raw)
-        for item in payload:
-            buy_chain = str(item["buy_chain"]).lower()
-            sell_chain = str(item["sell_chain"]).lower()
-            fees = float(item["fees"])
-            route_fees[(buy_chain, sell_chain)] = fees
+    min_net_profit = float(os.getenv("ARB_MIN_NET_PROFIT", "0.0"))
+    min_net_profit_pct = float(os.getenv("ARB_MIN_NET_PROFIT_PCT", "0.0"))
+    dex_fee_bps_per_swap = float(os.getenv("ARB_DEX_FEE_BPS_PER_SWAP", "30"))
+    gas_units_per_swap = int(os.getenv("ARB_GAS_UNITS_PER_SWAP", "220000"))
+    bridge_fee_url_template = os.getenv("ARB_BRIDGE_FEE_URL_TEMPLATE", "").strip()
+    bridge_fee_json_path = os.getenv("ARB_BRIDGE_FEE_JSON_PATH", "").strip()
 
     return ArbitrageConfig(
         volume=volume,
         min_diff_pct=min_diff_pct,
-        default_fees=default_fees,
-        route_fees=route_fees,
+        min_net_profit=min_net_profit,
+        min_net_profit_pct=min_net_profit_pct,
+        dex_fee_bps_per_swap=dex_fee_bps_per_swap,
+        gas_units_per_swap=gas_units_per_swap,
+        bridge_fee_url_template=bridge_fee_url_template,
+        bridge_fee_json_path=bridge_fee_json_path,
     )
