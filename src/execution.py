@@ -135,6 +135,9 @@ class ExecutionResult:
     sell_tx_hash: str
     bridged_amount: int
     quote_token_received: int
+    buy_receipt: dict[str, Any]
+    bridge_receipt: dict[str, Any]
+    sell_receipt: dict[str, Any]
 
 
 def _http_get_json(url: str, timeout_sec: int = 15) -> Any:
@@ -285,7 +288,17 @@ class ArbitrageExecutor:
         )
         if int(receipt["status"]) != 1:
             raise ExecutionError(f"Transaction failed on {chain}: {tx_hash}")
-        return dict(receipt)
+        return {
+            "transactionHash": receipt["transactionHash"].hex(),
+            "blockHash": receipt["blockHash"].hex(),
+            "blockNumber": int(receipt["blockNumber"]),
+            "status": int(receipt["status"]),
+            "gasUsed": int(receipt["gasUsed"]),
+            "cumulativeGasUsed": int(receipt["cumulativeGasUsed"]),
+            "effectiveGasPrice": int(receipt.get("effectiveGasPrice", 0)),
+            "from": receipt["from"],
+            "to": receipt["to"],
+        }
 
     def ensure_approval(self, chain: str, token_address: str, spender: str, min_amount: int) -> str | None:
         token = self._erc20(chain, token_address)
@@ -466,7 +479,7 @@ class ArbitrageExecutor:
             buy_pool.chain,
             self._build_swap_tx(buy_plan, buy_pool.router_address),
         )
-        self.wait_for_receipt(buy_pool.chain, buy_tx_hash)
+        buy_receipt = self.wait_for_receipt(buy_pool.chain, buy_tx_hash)
 
         bought_amount = self.erc20_balance(buy_pool.chain, buy_token0_address) - initial_buy_token0
         if bought_amount <= 0:
@@ -480,7 +493,7 @@ class ArbitrageExecutor:
             bridge_plan.amount_in,
         )
         bridge_tx_hash = self._sign_and_send(buy_pool.chain, bridge_plan.transaction)
-        self.wait_for_receipt(buy_pool.chain, bridge_tx_hash)
+        bridge_receipt = self.wait_for_receipt(buy_pool.chain, bridge_tx_hash)
 
         bridged_amount = self._wait_for_balance_increase(
             sell_pool.chain,
@@ -495,7 +508,7 @@ class ArbitrageExecutor:
             sell_pool.chain,
             self._build_swap_tx(sell_plan, sell_pool.router_address),
         )
-        self.wait_for_receipt(sell_pool.chain, sell_tx_hash)
+        sell_receipt = self.wait_for_receipt(sell_pool.chain, sell_tx_hash)
         final_quote_balance = self.erc20_balance(sell_pool.chain, sell_token1_address)
 
         return ExecutionResult(
@@ -504,4 +517,7 @@ class ArbitrageExecutor:
             sell_tx_hash=sell_tx_hash,
             bridged_amount=bridged_amount,
             quote_token_received=max(0, final_quote_balance - initial_quote_balance),
+            buy_receipt=buy_receipt,
+            bridge_receipt=bridge_receipt,
+            sell_receipt=sell_receipt,
         )

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from web3 import Web3
@@ -16,11 +17,13 @@ from src.config import (
     get_arbitrage_config,
     get_chain_configs,
     get_execution_config,
+    get_monitoring_config,
     get_v2_pool_configs,
 )
 from src.dex_uniswap_v2 import UniswapV2ReserveReader
 from src.execution import ArbitrageExecutor, ExecutionError
 from src.fees import FeeEstimationError, RealTimeFeeEstimator, route_pairs_from_snapshots
+from src.monitoring import MonitoringError, append_event, maybe_alert_failure, maybe_alert_success
 from src.price_types import ArbitrageOpportunity
 from src.ratio import compute_arbitrage_opportunities, compute_cross_chain_spreads
 
@@ -106,10 +109,72 @@ def _print_fee_quotes(route_fees) -> None:
         )
 
 
+def _event_base() -> dict[str, str]:
+    return {"event_time": datetime.now(timezone.utc).isoformat()}
+
+
+def _opportunity_fields(opp) -> dict[str, object]:
+    if opp is None:
+        return {}
+    return {
+        "pair_key": opp.pair_key,
+        "buy_chain": opp.buy_chain,
+        "sell_chain": opp.sell_chain,
+        "buy_price": opp.buy_price,
+        "sell_price": opp.sell_price,
+        "difference": opp.difference,
+        "difference_pct": opp.difference_pct,
+        "volume": opp.volume,
+        "gross_profit": opp.gross_profit,
+        "fees": opp.fees,
+        "estimated_net_profit": opp.net_profit,
+    }
+
+
+def _plan_fields(plan) -> dict[str, object]:
+    return {
+        "buy_swap_plan": {
+            "chain": plan.buy_swap.chain,
+            "dex": plan.buy_swap.dex,
+            "amount_in": plan.buy_swap.amount_in,
+            "amount_out_estimate": plan.buy_swap.amount_out_estimate,
+            "amount_out_min": plan.buy_swap.amount_out_min,
+            "token_in_symbol": plan.buy_swap.token_in_symbol,
+            "token_out_symbol": plan.buy_swap.token_out_symbol,
+        },
+        "bridge_plan": {
+            "from_chain": plan.bridge.from_chain,
+            "to_chain": plan.bridge.to_chain,
+            "amount_in": plan.bridge.amount_in,
+            "amount_out_estimate": plan.bridge.amount_out_estimate,
+            "amount_out_min": plan.bridge.amount_out_min,
+            "token_symbol": plan.bridge.token_symbol,
+            "tool": plan.bridge.tool,
+        },
+        "sell_swap_plan": {
+            "chain": plan.sell_swap.chain,
+            "dex": plan.sell_swap.dex,
+            "amount_in": plan.sell_swap.amount_in,
+            "amount_out_estimate": plan.sell_swap.amount_out_estimate,
+            "amount_out_min": plan.sell_swap.amount_out_min,
+            "token_in_symbol": plan.sell_swap.token_in_symbol,
+            "token_out_symbol": plan.sell_swap.token_out_symbol,
+        },
+    }
+
+
+def _safe_log(log_path: str, event: dict[str, object]) -> None:
+    try:
+        append_event(log_path, event)
+    except OSError as exc:
+        print(f"WARNING failed to write monitoring log: {exc}")
+
+
 async def _collect_best_opportunity():
     pools = get_v2_pool_configs()
     arb_cfg = get_arbitrage_config()
     execution_cfg = get_execution_config()
+    monitoring_cfg = get_monitoring_config()
     if not pools:
         print("No pools configured. Set V2_POOLS_JSON in .env.")
         return None
@@ -143,6 +208,17 @@ async def _collect_best_opportunity():
         route_fees=route_fees,
     )
     if not opportunities:
+        _safe_log(
+            monitoring_cfg.log_path,
+            {
+                **_event_base(),
+                "event_type": "scan_no_opportunity",
+                "snapshot_count": len(snapshots),
+                "route_fee_count": len(route_fees),
+                "top_spread_pct": spreads[0].spread_pct if spreads else None,
+                "reason": "Current spreads are either below thresholds or fully consumed by fees.",
+            },
+        )
         print(
             "No executable arbitrage opportunities found. "
             "Current spreads are either below thresholds or fully consumed by fees."
@@ -158,7 +234,7 @@ async def _collect_best_opportunity():
 
     executor = ArbitrageExecutor(chain_web3=chain_web3, execution_cfg=execution_cfg)
     plan = executor.plan_execution(best, buy_pool, sell_pool)
-    return executor, execution_cfg, best, buy_pool, sell_pool, plan
+    return executor, execution_cfg, monitoring_cfg, best, buy_pool, sell_pool, plan
 
 
 def _print_result(result, sell_pool) -> None:
@@ -172,20 +248,103 @@ def _print_result(result, sell_pool) -> None:
     )
 
 
-async def main() -> None:
+async def run_once(*, force_dry_run: bool = False) -> None:
     collected = await _collect_best_opportunity()
     if collected is None:
         return
 
-    executor, execution_cfg, best, buy_pool, sell_pool, plan = collected
-    _print_plan(plan, buy_pool, sell_pool, execution_cfg.live_mode)
+    executor, execution_cfg, monitoring_cfg, best, buy_pool, sell_pool, plan = collected
+    effective_live_mode = execution_cfg.live_mode and not force_dry_run
+    _print_plan(plan, buy_pool, sell_pool, effective_live_mode)
+    _safe_log(
+        monitoring_cfg.log_path,
+        {
+            **_event_base(),
+            "event_type": "execution_candidate",
+            "live_mode": effective_live_mode,
+            "forced_dry_run": force_dry_run,
+            **_opportunity_fields(best),
+            **_plan_fields(plan),
+        },
+    )
 
-    if not execution_cfg.live_mode:
-        print("Live execution is disabled. Set EXECUTION_LIVE_MODE=true after funding wallet and checking config.")
+    if not effective_live_mode:
+        _safe_log(
+            monitoring_cfg.log_path,
+            {
+                **_event_base(),
+                "event_type": "execution_skipped",
+                "stage": "pre_live_guard",
+                "reason": "Live execution disabled." if not force_dry_run else "Forced dry-run mode.",
+                "forced_dry_run": force_dry_run,
+                **_opportunity_fields(best),
+                **_plan_fields(plan),
+            },
+        )
+        if force_dry_run:
+            print("Forced dry-run mode is active. No transactions were submitted.")
+        else:
+            print("Live execution is disabled. Set EXECUTION_LIVE_MODE=true after funding wallet and checking config.")
         return
 
-    result = executor.execute(best, buy_pool, sell_pool)
+    try:
+        result = executor.execute(best, buy_pool, sell_pool)
+    except ExecutionError as exc:
+        event = {
+            **_event_base(),
+            "event_type": "execution_failed",
+            "stage": "execute",
+            "error": str(exc),
+            **_opportunity_fields(best),
+            **_plan_fields(plan),
+        }
+        _safe_log(monitoring_cfg.log_path, event)
+        try:
+            maybe_alert_failure(monitoring_cfg, event)
+        except MonitoringError as alert_exc:
+            print(f"WARNING alert delivery failed: {alert_exc}")
+        raise
+
     _print_result(result, sell_pool)
+    success_event = {
+        **_event_base(),
+        "event_type": "execution_succeeded",
+        **_opportunity_fields(best),
+        **_plan_fields(plan),
+        "buy_tx_hash": result.buy_tx_hash,
+        "bridge_tx_hash": result.bridge_tx_hash,
+        "sell_tx_hash": result.sell_tx_hash,
+        "bridged_amount": result.bridged_amount,
+        "quote_token_received": result.quote_token_received,
+        "buy_receipt": result.buy_receipt,
+        "bridge_receipt": result.bridge_receipt,
+        "sell_receipt": result.sell_receipt,
+    }
+    _safe_log(monitoring_cfg.log_path, success_event)
+    try:
+        maybe_alert_success(monitoring_cfg, success_event)
+    except MonitoringError as alert_exc:
+        print(f"WARNING alert delivery failed: {alert_exc}")
+
+
+async def main() -> None:
+    monitoring_cfg = get_monitoring_config()
+    interval = max(1, monitoring_cfg.execution_loop_interval_sec)
+    cycle = 0
+
+    print("Starting arbitrage execution loop (Ctrl+C to stop)")
+    print(f"loop_interval_sec={interval}")
+
+    while True:
+        cycle += 1
+        print(f"[cycle {cycle}] scanning opportunities")
+        try:
+            await run_once()
+        except (ExecutionError, ValueError) as exc:
+            print(f"[cycle {cycle}] Execution failed: {exc}")
+
+        print(f"[cycle {cycle}] sleeping {interval}s")
+        await asyncio.sleep(interval)
 
 
 if __name__ == "__main__":
@@ -193,7 +352,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except json.JSONDecodeError:
         print("Invalid JSON format in .env. Check V2_POOLS_JSON and fee config JSON fields.")
-    except (ExecutionError, ValueError) as exc:
-        print(f"Execution failed: {exc}")
     except KeyboardInterrupt:
         print("Stopped.")

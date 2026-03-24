@@ -64,6 +64,16 @@ class ExecutionConfig:
     lifi_base_url: str
 
 
+@dataclass(frozen=True)
+class MonitoringConfig:
+    log_path: str
+    dashboard_window_entries: int
+    alert_webhook_url: str
+    alert_on_failure: bool
+    alert_on_success: bool
+    execution_loop_interval_sec: int
+
+
 def get_chain_configs() -> list[ChainConfig]:
     chains = [
         ("ethereum", os.getenv("ETH_RPC_URL", ""), 1),
@@ -147,4 +157,15 @@ def get_execution_config() -> ExecutionConfig:
         bridge_poll_interval_sec=int(os.getenv("EXECUTION_BRIDGE_POLL_INTERVAL_SEC", "5")),
         min_native_balance=float(os.getenv("EXECUTION_MIN_NATIVE_BALANCE", "0.005")),
         lifi_base_url=os.getenv("EXECUTION_LIFI_BASE_URL", "https://li.quest/v1").strip(),
+    )
+
+
+def get_monitoring_config() -> MonitoringConfig:
+    return MonitoringConfig(
+        log_path=os.getenv("MONITORING_LOG_PATH", "logs/arbitrage_events.jsonl").strip(),
+        dashboard_window_entries=int(os.getenv("MONITORING_DASHBOARD_WINDOW_ENTRIES", "200")),
+        alert_webhook_url=os.getenv("MONITORING_ALERT_WEBHOOK_URL", "").strip(),
+        alert_on_failure=_env_bool("MONITORING_ALERT_ON_FAILURE", True),
+        alert_on_success=_env_bool("MONITORING_ALERT_ON_SUCCESS", False),
+        execution_loop_interval_sec=int(os.getenv("MONITORING_EXECUTION_LOOP_INTERVAL_SEC", "300")),
     )
