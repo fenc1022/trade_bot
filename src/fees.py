@@ -4,6 +4,7 @@ import json
 import urllib.parse
 import urllib.request
 from typing import Any
+from urllib.parse import urlsplit
 
 from web3 import Web3
 
@@ -61,6 +62,19 @@ def _lifi_same_token_fee_usd(payload: Any) -> float:
     return fee_units / (10 ** decimals)
 
 
+def _lifi_base_url(url_template: str) -> str:
+    if not url_template:
+        return "https://li.quest/v1"
+    parsed = urlsplit(url_template)
+    if not parsed.scheme or not parsed.netloc:
+        return "https://li.quest/v1"
+    path = parsed.path or ""
+    if "/v1" in path:
+        prefix = path.split("/v1", 1)[0]
+        return f"{parsed.scheme}://{parsed.netloc}{prefix}/v1"
+    return f"{parsed.scheme}://{parsed.netloc}/v1"
+
+
 class RealTimeFeeEstimator:
     def __init__(
         self,
@@ -69,6 +83,7 @@ class RealTimeFeeEstimator:
     ) -> None:
         self.chain_web3 = chain_web3
         self.cfg = cfg
+        self._lifi_token_cache: dict[tuple[int, str], dict[str, Any]] = {}
 
     def _native_price_usd(self, chain: str) -> float:
         coingecko_id = CHAIN_NATIVE_COINGECKO_ID.get(chain)
@@ -98,15 +113,63 @@ class RealTimeFeeEstimator:
                 "Missing ARB_BRIDGE_FEE_URL_TEMPLATE or ARB_BRIDGE_FEE_JSON_PATH"
             )
 
+        if self.cfg.bridge_fee_json_path == "__LIFI_SAME_TOKEN_FEE_USD__":
+            return self._lifi_same_token_quote_fee_usd(
+                buy_chain=buy_chain,
+                sell_chain=sell_chain,
+                volume=volume,
+            )
+
         url = self.cfg.bridge_fee_url_template.format(
             buy_chain=buy_chain,
             sell_chain=sell_chain,
             volume=volume,
         )
         payload = _http_get_json(url)
-        if self.cfg.bridge_fee_json_path == "__LIFI_SAME_TOKEN_FEE_USD__":
-            return _lifi_same_token_fee_usd(payload)
         return _json_path_get(payload, self.cfg.bridge_fee_json_path)
+
+    def _lifi_token(self, chain_id: int, symbol: str) -> dict[str, Any]:
+        cache_key = (chain_id, symbol.upper())
+        cached = self._lifi_token_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        base_url = _lifi_base_url(self.cfg.bridge_fee_url_template)
+        query = urllib.parse.urlencode({"chain": str(chain_id), "token": symbol})
+        payload = _http_get_json(f"{base_url}/token?{query}")
+        if not isinstance(payload, dict) or "address" not in payload or "decimals" not in payload:
+            raise FeeEstimationError(f"Unexpected LI.FI token payload for {symbol} on chain {chain_id}: {payload!r}")
+
+        self._lifi_token_cache[cache_key] = payload
+        return payload
+
+    def _lifi_same_token_quote_fee_usd(self, buy_chain: str, sell_chain: str, volume: float) -> float:
+        buy_w3 = self.chain_web3.get(buy_chain)
+        sell_w3 = self.chain_web3.get(sell_chain)
+        if buy_w3 is None or sell_w3 is None:
+            raise FeeEstimationError(f"Missing Web3 client for route {buy_chain}->{sell_chain}")
+
+        buy_chain_id = int(buy_w3.eth.chain_id)
+        sell_chain_id = int(sell_w3.eth.chain_id)
+        from_token = self._lifi_token(buy_chain_id, "USDC")
+        to_token = self._lifi_token(sell_chain_id, "USDC")
+        from_decimals = int(from_token["decimals"])
+        from_amount = int(volume * (10 ** from_decimals))
+
+        base_url = _lifi_base_url(self.cfg.bridge_fee_url_template)
+        query = urllib.parse.urlencode(
+            {
+                "fromChain": str(buy_chain_id),
+                "toChain": str(sell_chain_id),
+                "fromToken": str(from_token["address"]),
+                "toToken": str(to_token["address"]),
+                "fromAddress": "0x000000000000000000000000000000000000dEaD",
+                "toAddress": "0x000000000000000000000000000000000000dEaD",
+                "fromAmount": str(from_amount),
+            }
+        )
+        payload = _http_get_json(f"{base_url}/quote?{query}")
+        return _lifi_same_token_fee_usd(payload)
 
     def estimate_route_fees(
         self,
