@@ -35,12 +35,30 @@ def _json_path_get(payload: Any, path: str) -> float:
     for key in path.split("."):
         if isinstance(current, dict) and key in current:
             current = current[key]
-        else:
-            raise FeeEstimationError(f"JSON path '{path}' not found")
+            continue
+        if isinstance(current, list):
+            try:
+                current = current[int(key)]
+                continue
+            except (ValueError, IndexError) as exc:
+                raise FeeEstimationError(f"JSON path '{path}' not found") from exc
+        raise FeeEstimationError(f"JSON path '{path}' not found")
     try:
         return float(current)
     except (TypeError, ValueError) as exc:
         raise FeeEstimationError(f"Value at '{path}' is not numeric: {current!r}") from exc
+
+
+def _lifi_same_token_fee_usd(payload: Any) -> float:
+    try:
+        from_amount = int(payload["estimate"]["fromAmount"])
+        to_amount = int(payload["estimate"]["toAmount"])
+        decimals = int(payload["action"]["fromToken"]["decimals"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise FeeEstimationError("Unexpected LI.FI quote payload") from exc
+
+    fee_units = max(0, from_amount - to_amount)
+    return fee_units / (10 ** decimals)
 
 
 class RealTimeFeeEstimator:
@@ -86,6 +104,8 @@ class RealTimeFeeEstimator:
             volume=volume,
         )
         payload = _http_get_json(url)
+        if self.cfg.bridge_fee_json_path == "__LIFI_SAME_TOKEN_FEE_USD__":
+            return _lifi_same_token_fee_usd(payload)
         return _json_path_get(payload, self.cfg.bridge_fee_json_path)
 
     def estimate_route_fees(
