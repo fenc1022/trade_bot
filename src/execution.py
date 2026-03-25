@@ -204,6 +204,10 @@ class ArbitrageExecutor:
     def validate_pool(self, pool: V2PoolConfig) -> None:
         if not pool.router_address:
             raise ExecutionError(f"Pool {pool.chain}:{pool.dex}:{pool.pair_key} is missing router_address")
+        if pool.price_inverted or pool.pair_key_override:
+            raise ExecutionError(
+                f"Pool {pool.chain}:{pool.dex}:{pool.pair_key} is configured for monitoring-only normalized pricing"
+            )
 
     def validate_wallet(self) -> None:
         if not self.execution_cfg.wallet_private_key:

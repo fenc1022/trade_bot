@@ -28,6 +28,17 @@ from src.price_types import ArbitrageOpportunity
 from src.ratio import compute_arbitrage_opportunities, compute_cross_chain_spreads
 
 
+class RuntimeContext:
+    def __init__(self) -> None:
+        self.pools = get_v2_pool_configs()
+        self.arb_cfg = get_arbitrage_config()
+        self.execution_cfg = get_execution_config()
+        self.monitoring_cfg = get_monitoring_config()
+        self.chain_web3 = _build_chain_web3()
+        self.reader = UniswapV2ReserveReader(self.chain_web3)
+        self.fee_estimator = RealTimeFeeEstimator(chain_web3=self.chain_web3, cfg=self.arb_cfg)
+
+
 def _build_chain_web3() -> dict[str, Web3]:
     return {chain.name: Web3(Web3.HTTPProvider(chain.rpc_url)) for chain in get_chain_configs()}
 
@@ -132,6 +143,8 @@ def _opportunity_fields(opp) -> dict[str, object]:
 
 
 def _plan_fields(plan) -> dict[str, object]:
+    if plan is None:
+        return {}
     return {
         "buy_swap_plan": {
             "chain": plan.buy_swap.chain,
@@ -170,20 +183,16 @@ def _safe_log(log_path: str, event: dict[str, object]) -> None:
         print(f"WARNING failed to write monitoring log: {exc}")
 
 
-async def _collect_best_opportunity():
-    pools = get_v2_pool_configs()
-    arb_cfg = get_arbitrage_config()
-    execution_cfg = get_execution_config()
-    monitoring_cfg = get_monitoring_config()
+async def _collect_best_opportunity(ctx: RuntimeContext):
+    pools = ctx.pools
+    arb_cfg = ctx.arb_cfg
+    execution_cfg = ctx.execution_cfg
+    monitoring_cfg = ctx.monitoring_cfg
     if not pools:
         print("No pools configured. Set V2_POOLS_JSON in .env.")
         return None
 
-    chain_web3 = _build_chain_web3()
-    reader = UniswapV2ReserveReader(chain_web3)
-    fee_estimator = RealTimeFeeEstimator(chain_web3=chain_web3, cfg=arb_cfg)
-
-    snapshots, errors = await collect_v2_snapshots(reader, pools)
+    snapshots, errors = await collect_v2_snapshots(ctx.reader, pools)
     for error in errors:
         print(f"ERROR {error}")
     _print_snapshots(snapshots)
@@ -193,7 +202,7 @@ async def _collect_best_opportunity():
     route_fees = {}
     for buy_chain, sell_chain in sorted(route_pairs_from_snapshots(snapshots)):
         try:
-            route_fees[(buy_chain, sell_chain)] = fee_estimator.estimate_route_fees(
+            route_fees[(buy_chain, sell_chain)] = ctx.fee_estimator.estimate_route_fees(
                 buy_chain=buy_chain,
                 sell_chain=sell_chain,
                 volume=arb_cfg.volume,
@@ -232,9 +241,8 @@ async def _collect_best_opportunity():
         print(f"Missing pool config for opportunity {best.pair_key} {best.buy_chain}->{best.sell_chain}")
         return None
 
-    executor = ArbitrageExecutor(chain_web3=chain_web3, execution_cfg=execution_cfg)
-    plan = executor.plan_execution(best, buy_pool, sell_pool)
-    return executor, execution_cfg, monitoring_cfg, best, buy_pool, sell_pool, plan
+    executor = ArbitrageExecutor(chain_web3=ctx.chain_web3, execution_cfg=execution_cfg)
+    return executor, execution_cfg, monitoring_cfg, best, buy_pool, sell_pool
 
 
 def _print_result(result, sell_pool) -> None:
@@ -248,14 +256,22 @@ def _print_result(result, sell_pool) -> None:
     )
 
 
-async def run_once(*, force_dry_run: bool = False) -> None:
-    collected = await _collect_best_opportunity()
+async def run_once(ctx: RuntimeContext, *, force_dry_run: bool = False) -> None:
+    collected = await _collect_best_opportunity(ctx)
     if collected is None:
         return
 
-    executor, execution_cfg, monitoring_cfg, best, buy_pool, sell_pool, plan = collected
+    executor, execution_cfg, monitoring_cfg, best, buy_pool, sell_pool = collected
     effective_live_mode = execution_cfg.live_mode and not force_dry_run
-    _print_plan(plan, buy_pool, sell_pool, effective_live_mode)
+    plan = None
+    if effective_live_mode:
+        plan = executor.plan_execution(best, buy_pool, sell_pool)
+        _print_plan(plan, buy_pool, sell_pool, effective_live_mode)
+    else:
+        print(
+            f"Selected opportunity: {best.pair_key} "
+            f"buy={best.buy_chain} sell={best.sell_chain} net={best.net_profit:.4f}"
+        )
     _safe_log(
         monitoring_cfg.log_path,
         {
@@ -328,7 +344,8 @@ async def run_once(*, force_dry_run: bool = False) -> None:
 
 
 async def main() -> None:
-    monitoring_cfg = get_monitoring_config()
+    ctx = RuntimeContext()
+    monitoring_cfg = ctx.monitoring_cfg
     interval = max(1, monitoring_cfg.execution_loop_interval_sec)
     cycle = 0
 
@@ -339,7 +356,7 @@ async def main() -> None:
         cycle += 1
         print(f"[cycle {cycle}] scanning opportunities")
         try:
-            await run_once()
+            await run_once(ctx)
         except (ExecutionError, ValueError) as exc:
             print(f"[cycle {cycle}] Execution failed: {exc}")
 

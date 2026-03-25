@@ -42,7 +42,10 @@ class UniswapV2ReserveReader:
         if reserve0_norm == 0:
             raise ValueError(f"Zero reserve0 for pool {pool.pool_address}")
 
-        price = reserve1_norm / reserve0_norm
+        raw_price = reserve1_norm / reserve0_norm
+        if raw_price == 0:
+            raise ValueError(f"Zero price for pool {pool.pool_address}")
+        price = (1 / raw_price) if pool.price_inverted else raw_price
         latency_ms = (time.perf_counter() - start) * 1000
 
         return PriceSnapshot(

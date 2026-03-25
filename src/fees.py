@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import time
 import urllib.parse
 import urllib.request
 from typing import Any
+from urllib.error import HTTPError
 from urllib.parse import urlsplit
 
 from web3 import Web3
@@ -16,13 +18,17 @@ CHAIN_NATIVE_COINGECKO_ID = {
     "arbitrum": "ethereum",
     "base": "ethereum",
     "bsc": "binancecoin",
-    "polygon": "matic-network",
+    "polygon": "polygon-ecosystem-token",
     "avalanche": "avalanche-2",
 }
 
 
 class FeeEstimationError(Exception):
     pass
+
+
+EXTERNAL_PRICE_CACHE_TTL_SEC = 300
+BRIDGE_FEE_CACHE_TTL_SEC = 300
 
 
 def _http_get_json(url: str, timeout_sec: int = 8) -> Any:
@@ -84,17 +90,52 @@ class RealTimeFeeEstimator:
         self.chain_web3 = chain_web3
         self.cfg = cfg
         self._lifi_token_cache: dict[tuple[int, str], dict[str, Any]] = {}
+        self._native_price_cache: dict[str, tuple[float, float]] = {}
+        self._bridge_fee_cache: dict[tuple[str, str, float], tuple[float, float]] = {}
+
+    def _cached_value(self, cache: dict[Any, tuple[float, float]], key: Any, ttl_sec: int) -> float | None:
+        cached = cache.get(key)
+        if cached is None:
+            return None
+        value, timestamp = cached
+        if time.time() - timestamp <= ttl_sec:
+            return value
+        return None
+
+    def _stale_value(self, cache: dict[Any, tuple[float, float]], key: Any) -> float | None:
+        cached = cache.get(key)
+        if cached is None:
+            return None
+        value, _timestamp = cached
+        return value
+
+    def _remember(self, cache: dict[Any, tuple[float, float]], key: Any, value: float) -> float:
+        cache[key] = (value, time.time())
+        return value
+
+    def _is_rate_limited(self, exc: Exception) -> bool:
+        return isinstance(exc, HTTPError) and exc.code == 429
 
     def _native_price_usd(self, chain: str) -> float:
         coingecko_id = CHAIN_NATIVE_COINGECKO_ID.get(chain)
         if not coingecko_id:
             raise FeeEstimationError(f"No native price mapping for chain '{chain}'")
 
+        cached = self._cached_value(self._native_price_cache, coingecko_id, EXTERNAL_PRICE_CACHE_TTL_SEC)
+        if cached is not None:
+            return cached
+
         query = urllib.parse.urlencode({"ids": coingecko_id, "vs_currencies": "usd"})
         url = f"https://api.coingecko.com/api/v3/simple/price?{query}"
-        payload = _http_get_json(url)
         try:
-            return float(payload[coingecko_id]["usd"])
+            payload = _http_get_json(url)
+        except OSError as exc:
+            stale = self._stale_value(self._native_price_cache, coingecko_id)
+            if stale is not None and self._is_rate_limited(exc):
+                return stale
+            raise
+        try:
+            return self._remember(self._native_price_cache, coingecko_id, float(payload[coingecko_id]["usd"]))
         except (KeyError, TypeError, ValueError) as exc:
             raise FeeEstimationError(f"Unexpected CoinGecko payload for '{chain}': {payload!r}") from exc
 
@@ -144,6 +185,11 @@ class RealTimeFeeEstimator:
         return payload
 
     def _lifi_same_token_quote_fee_usd(self, buy_chain: str, sell_chain: str, volume: float) -> float:
+        cache_key = (buy_chain, sell_chain, volume)
+        cached = self._cached_value(self._bridge_fee_cache, cache_key, BRIDGE_FEE_CACHE_TTL_SEC)
+        if cached is not None:
+            return cached
+
         buy_w3 = self.chain_web3.get(buy_chain)
         sell_w3 = self.chain_web3.get(sell_chain)
         if buy_w3 is None or sell_w3 is None:
@@ -168,8 +214,14 @@ class RealTimeFeeEstimator:
                 "fromAmount": str(from_amount),
             }
         )
-        payload = _http_get_json(f"{base_url}/quote?{query}")
-        return _lifi_same_token_fee_usd(payload)
+        try:
+            payload = _http_get_json(f"{base_url}/quote?{query}")
+        except OSError as exc:
+            stale = self._stale_value(self._bridge_fee_cache, cache_key)
+            if stale is not None and self._is_rate_limited(exc):
+                return stale
+            raise
+        return self._remember(self._bridge_fee_cache, cache_key, _lifi_same_token_fee_usd(payload))
 
     def estimate_route_fees(
         self,

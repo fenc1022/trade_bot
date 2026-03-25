@@ -28,10 +28,12 @@ class V2PoolConfig:
     token0_address: str = ""
     token1_address: str = ""
     router_address: str = ""
+    pair_key_override: str = ""
+    price_inverted: bool = False
 
     @property
     def pair_key(self) -> str:
-        return f"{self.token0_symbol}/{self.token1_symbol}"
+        return self.pair_key_override or f"{self.token0_symbol}/{self.token1_symbol}"
 
     @property
     def has_execution_config(self) -> bool:
@@ -111,6 +113,8 @@ def get_v2_pool_configs() -> list[V2PoolConfig]:
                 token0_address=str(item.get("token0_address", "")),
                 token1_address=str(item.get("token1_address", "")),
                 router_address=str(item.get("router_address", "")),
+                pair_key_override=str(item.get("pair_key_override", "")),
+                price_inverted=bool(item.get("price_inverted", False)),
             )
         )
     return pools
